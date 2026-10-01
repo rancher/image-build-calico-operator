@@ -44,5 +44,8 @@ actions:
     title: 'Bump calico-operator version to {{ source "upstream" }}'
     kind: github/pullrequest
     spec:
-      automerge: false
+      merge:
+        strategy: auto
+      labels:
+        - updatecli
     scmid: default
