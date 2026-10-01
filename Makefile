@@ -12,7 +12,6 @@ ifndef TARGET_PLATFORMS
 endif
 
 REPO ?= ghcr.io/rancher
-PKG ?= github.com/tigera/operator
 BUILD_META=-build$(shell date +%Y%m%d)
 TAG ?= ${GITHUB_ACTION_TAG}
 
@@ -29,7 +28,6 @@ build-image: IMAGE = $(REPO)/hardened-calico-operator:$(TAG)
 build-image:
 	docker buildx build \
 		--platform=$(TARGET_PLATFORMS) \
-		--build-arg PKG=$(PKG) \
 		--build-arg TAG=$(TAG:$(BUILD_META)=) \
 		--tag $(IMAGE) \
 		--load \
@@ -43,7 +41,6 @@ push-image:
 		--sbom=true \
 		--attest type=provenance,mode=max \
 		--platform=$(TARGET_PLATFORMS) \
-		--build-arg PKG=$(PKG) \
 		--build-arg TAG=$(TAG:$(BUILD_META)=) \
 		--tag $(IMAGE) \
 		--push \
@@ -63,7 +60,6 @@ image-scan:
 log:
 	@echo "TARGET_PLATFORMS=$(TARGET_PLATFORMS)"
 	@echo "REPO=$(REPO)"
-	@echo "PKG=$(PKG)"
 	@echo "TAG=$(TAG:$(BUILD_META)=)"
 	@echo "BUILD_META=$(BUILD_META)"
 	@echo "UNAME_M=$(UNAME_M)"
