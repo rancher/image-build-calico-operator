@@ -46,12 +46,6 @@ push-image:
 		--push \
 		.
 
-.PHONY: build-image-all
-build-image-all: build-image
-
-.PHONY: push-image-all
-push-image-all: push-image
-
 .PHONY: image-scan
 image-scan:
 	trivy image --severity $(SEVERITIES) --no-progress --ignore-unfixed $(REPO)/hardened-calico-operator:$(TAG)
