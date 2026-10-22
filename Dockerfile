@@ -59,5 +59,6 @@ RUN set -eu; \
 
 FROM ${BCI_IMAGE} AS hardened-calico-operator
 LABEL org.opencontainers.image.description="Calico operator (Tigera operator)"
-COPY --from=builder /usr/local/bin/operator /operator
-ENTRYPOINT ["/operator"]
+# Chart expects the operator to be in PATH
+COPY --from=builder /usr/local/bin/operator /usr/local/bin/operator
+ENTRYPOINT ["/usr/local/bin/operator"]
