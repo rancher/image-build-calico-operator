@@ -22,6 +22,72 @@ The upstream version is controlled by the [`TAG`](./TAG) file.
 A `-buildYYYYMMDD` suffix (`BUILD_META`) is appended automatically and is required on
 release tags.
 
+## Exact Calico component tags
+
+This hardened operator adds the downstream runtime setting
+`CALICO_IMAGE_TAG_OVERRIDES`. Upstream does not provide this environment interface.
+Set it on the operator Deployment to a JSON object mapping upstream Calico image
+basenames to complete image tags:
+
+```yaml
+tigeraOperator:
+  env:
+    - name: CALICO_IMAGE_TAG_OVERRIDES
+      value: '{"calico":"v3.33.0-build20261022","node":"v3.33.0-build20261022","third-party-cni-plugins":"v3.33.0-build20261022"}'
+```
+
+The existing chart forwards `tigeraOperator.env`; no chart change is required.
+
+Resolution order:
+
+1. A selected ImageSet retains upstream digest resolution and validation.
+   Missing entries and invalid ImageSets remain errors; overrides cannot provide
+   a fallback.
+2. Without an ImageSet, an explicitly configured Calico component uses its exact
+   tag, after existing component replacement selection.
+3. Unlisted components retain their compiled upstream versions.
+
+### Downstream patch and tests
+
+The version-specific [patch](./patches/0001-calico-image-tag-overrides.patch)
+adds startup validation and the final tag-selection hook without changing
+upstream component definitions. 
+
+### Debugging and updating the patch
+
+The `operator-dev` target provides the patched checkout and build dependencies
+**before tests and compilation**, even when Go code is broken.
+
+```sh
+make build-dev
+make dev-shell
+```
+
+Edit source, use the upstream Makefile, or run:
+
+```sh
+go test -p 2 ./pkg/components ./pkg/render ./pkg/render/kubecontrollers \
+  ./pkg/render/whisker ./pkg/controller/utils/imageset
+```
+
+Export from a **second host terminal** while the container runs:
+
+```sh
+make export-patch
+```
+
+Export replaces `patches/0001-calico-image-tag-overrides.patch`; use
+`PATCH_FILE=review.patch` to save separately. 
+
+Exiting preserves edits. Resume instead of creating another container:
+
+```sh
+docker start -ai calico-operator-dev
+```
+Review the exported patch, then run `make build-dev` to check application and
+`make build-image` for tests and hardened compilation. Builds use exported
+patches, not container edits.
+
 ## Automated updates
 
 [Updatecli](./updatecli) keeps two things current via daily PRs:

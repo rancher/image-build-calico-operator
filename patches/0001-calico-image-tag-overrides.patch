@@ -1,0 +1,456 @@
+diff --git a/cmd/main.go b/cmd/main.go
+index a8bd80b..6ce9967 100644
+--- a/cmd/main.go
++++ b/cmd/main.go
+@@ -181,6 +181,15 @@ admission policy installation; once an Installation exists it is the authority o
+ 
+ 	ctrl.SetLogger(zap.New(zap.WriteTo(os.Stdout), zap.UseFlagOptions(&opts)))
+ 
++	tags, err := components.LoadCalicoImageTagOverrides()
++	if err != nil {
++		setupLog.Error(err, "Invalid Calico image tag override configuration")
++		os.Exit(1)
++	}
++	if len(tags) != 0 {
++		setupLog.Info("Configured Calico image tag overrides", "overrides", tags)
++	}
++
+ 	// An unrecognised variant is silently treated as Calico, which installs the wrong CRDs for
+ 	// the bootstrap-crds path where nothing runs afterwards to correct them.
+ 	switch v := operatortigeraiov1.ProductVariant(bootstrapVariant); {
+diff --git a/pkg/components/references.go b/pkg/components/references.go
+index 49f17c5..c136e91 100644
+--- a/pkg/components/references.go
++++ b/pkg/components/references.go
+@@ -108,6 +108,11 @@ func GetReference(c Component, registry, imagePath, imagePrefix string, is *oper
+ 	}
+ 
+ 	if is == nil {
++		if c.variant == calicoVariant {
++			if tag, ok := calicoImageTagOverrides[c.Image]; ok {
++				c.Version = tag
++			}
++		}
+ 		return fmt.Sprintf("%s:%s", path.Join(registry, imagePath, imageName), c.Version), nil
+ 	}
+ 
+diff --git a/pkg/components/tag_overrides.go b/pkg/components/tag_overrides.go
+new file mode 100644
+index 0000000..24e9262
+--- /dev/null
++++ b/pkg/components/tag_overrides.go
+@@ -0,0 +1,84 @@
++package components
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"os"
++	"regexp"
++	"strings"
++)
++
++const CalicoImageTagOverridesEnv = "CALICO_IMAGE_TAG_OVERRIDES"
++
++// OCI/Docker tag grammar: an ASCII word character followed by up to 127
++// ASCII word characters, periods, or hyphens.
++var imageTagPattern = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$`)
++
++// Written once before controllers start; reconciliation only reads this map.
++var calicoImageTagOverrides map[string]string
++
++// LoadCalicoImageTagOverrides validates the environment and installs exact tags
++// without modifying component versions or the logical Calico release.
++func LoadCalicoImageTagOverrides() (map[string]string, error) {
++	value, present := os.LookupEnv(CalicoImageTagOverridesEnv)
++	tags, err := parseCalicoImageTagOverrides(value, present)
++	if err != nil {
++		return nil, fmt.Errorf("%s: %w", CalicoImageTagOverridesEnv, err)
++	}
++	calicoImageTagOverrides = tags
++	// Do not expose the map used by concurrent reconcilers to mutation.
++	result := make(map[string]string, len(tags))
++	for component, tag := range tags {
++		result[component] = tag
++	}
++	return result, nil
++}
++
++func parseCalicoImageTagOverrides(value string, present bool) (map[string]string, error) {
++	tags := map[string]string{}
++	if !present {
++		return tags, nil
++	}
++	decoder := json.NewDecoder(strings.NewReader(value))
++	token, err := decoder.Token()
++	if err != nil {
++		return nil, fmt.Errorf("expected a JSON object: %w", err)
++	}
++	if token != json.Delim('{') {
++		return nil, fmt.Errorf("expected a JSON object")
++	}
++	known := map[string]bool{}
++	for _, component := range CalicoImages {
++		known[component.Image] = true
++	}
++	for decoder.More() {
++		token, err = decoder.Token()
++		if err != nil {
++			return nil, fmt.Errorf("invalid component key: %w", err)
++		}
++		key, ok := token.(string)
++		if !ok || !known[key] {
++			return nil, fmt.Errorf("unknown Calico component %q", token)
++		}
++		if _, duplicate := tags[key]; duplicate {
++			return nil, fmt.Errorf("duplicate component %q", key)
++		}
++		var value any
++		if err := decoder.Decode(&value); err != nil {
++			return nil, fmt.Errorf("invalid tag for %q: %w", key, err)
++		}
++		tag, ok := value.(string)
++		if !ok || !imageTagPattern.MatchString(tag) {
++			return nil, fmt.Errorf("invalid tag for %q: expected a complete image tag matching [A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", key)
++		}
++		tags[key] = tag
++	}
++	if _, err := decoder.Token(); err != nil {
++		return nil, fmt.Errorf("invalid JSON object: %w", err)
++	}
++	if _, err := decoder.Token(); err != io.EOF {
++		return nil, fmt.Errorf("unexpected data after JSON object")
++	}
++	return tags, nil
++}
+diff --git a/pkg/components/tag_overrides_test.go b/pkg/components/tag_overrides_test.go
+new file mode 100644
+index 0000000..8c7a33d
+--- /dev/null
++++ b/pkg/components/tag_overrides_test.go
+@@ -0,0 +1,95 @@
++package components
++
++import (
++	"strings"
++	"testing"
++
++	operator "github.com/tigera/operator/api/v1"
++)
++
++func TestCalicoTagOverrideConfiguration(t *testing.T) {
++	for _, value := range []string{
++		"", " ", "null", "[]", `"tag"`, "1", "true", "{",
++		`{"node":null}`, `{"node":1}`, `{"node":true}`, `{"node":[]}`, `{"node":{}}`,
++		`{"node":""}`, `{"node":"-bad"}`, `{"node":".bad"}`, `{"node":"a b"}`,
++		`{"node":"registry/repo:tag"}`, `{"node":"sha256:abc"}`, `{"node":"é"}`,
++		`{"node":"` + strings.Repeat("a", 129) + `"}`,
++		`{"typha":"v1"}`, `{"hardened-calico-node":"v1"}`, `{"operator":"v1"}`,
++		`{"node":"v1","node":"v2"}`, `{"node":"v1","\u006eode":"v2"}`,
++		`{} {}`, `{} trailing`, `{"node":"v1",}`,
++	} {
++		t.Run(value, func(t *testing.T) {
++			if _, err := parseCalicoImageTagOverrides(value, true); err == nil {
++				t.Fatalf("accepted invalid configuration %q", value)
++			}
++		})
++	}
++	for _, value := range []string{"{}", " \n{} ", `{"node":"_tag-1.2"}`, `{"node":"` + strings.Repeat("a", 128) + `"}`} {
++		if _, err := parseCalicoImageTagOverrides(value, true); err != nil {
++			t.Fatalf("rejected valid configuration %q: %v", value, err)
++		}
++	}
++	if tags, err := parseCalicoImageTagOverrides("", false); err != nil || len(tags) != 0 {
++		t.Fatalf("absent variable: %v, %v", tags, err)
++	}
++}
++
++func TestCalicoTagOverrideReferences(t *testing.T) {
++	old := calicoImageTagOverrides
++	t.Cleanup(func() { calicoImageTagOverrides = old })
++	t.Setenv(CalicoImageTagOverridesEnv, `{"calico":"v3.33.0-build20261022","node":"v3.33.0-build20261023","third-party-cni-plugins":"v3.33.0-build20261024"}`)
++	tags, err := LoadCalicoImageTagOverrides()
++	if err != nil {
++		t.Fatal(err)
++	}
++	tags["node"] = "must-not-mutate-internal-map"
++	for _, c := range CalicoImages {
++		tag := c.Version
++		if override, ok := calicoImageTagOverrides[c.Image]; ok {
++			tag = override
++		}
++		for _, registry := range []string{"registry.suse.com", "mirror.example:5000"} {
++			got, err := GetReference(c, registry, "rancher", "hardened-calico-", nil)
++			want := registry + "/rancher/hardened-calico-" + c.Image + ":" + tag
++			if err != nil || got != want {
++				t.Fatalf("got %q, %v; want %q", got, err, want)
++			}
++		}
++	}
++	for _, c := range append(append([]Component{}, EnterpriseImages...), ComponentOperatorInit) {
++		got, err := GetReference(c, "mirror", "images", "", nil)
++		if want := "mirror/images/" + c.Image + ":" + c.Version; err != nil || got != want {
++			t.Fatalf("non-Calico component changed: %q, %v; want %q", got, err, want)
++		}
++	}
++	digest := "sha256:" + strings.Repeat("a", 64)
++	is := &operator.ImageSet{Spec: operator.ImageSetSpec{Images: []operator.Image{{Image: "calico/node", Digest: digest}}}}
++	if got, err := GetReference(ComponentCalicoNode, "mirror", "images", "prefix-", is); err != nil || got != "mirror/images/prefix-node@"+digest {
++		t.Fatalf("ImageSet precedence: %q, %v", got, err)
++	}
++	if _, err := GetReference(ComponentCalico, "", "", "", is); err == nil {
++		t.Fatal("missing ImageSet entry fell back to tag")
++	}
++	if CalicoRelease != "v3.33.0" || ComponentCalicoNode.Version != "v3.33.0" {
++		t.Fatal("compiled release identity changed")
++	}
++	for _, value := range []string{"{}", ""} {
++		if value == "" {
++			t.Setenv(CalicoImageTagOverridesEnv, "")
++			if _, err := LoadCalicoImageTagOverrides(); err == nil || !strings.Contains(err.Error(), CalicoImageTagOverridesEnv) {
++				t.Fatalf("startup error lacks environment context: %v", err)
++			}
++			continue
++		}
++		t.Setenv(CalicoImageTagOverridesEnv, value)
++		if _, err := LoadCalicoImageTagOverrides(); err != nil {
++			t.Fatal(err)
++		}
++		for _, prefix := range []string{"", "hardened-calico-"} {
++			got, err := GetReference(ComponentCalicoNode, "mirror", "images", prefix, nil)
++			if want := "mirror/images/" + prefix + "node:v3.33.0"; err != nil || got != want {
++				t.Fatalf("no-op changed reference: %q, %v", got, err)
++			}
++		}
++	}
++}
+diff --git a/pkg/controller/utils/imageset/imageset_test.go b/pkg/controller/utils/imageset/imageset_test.go
+index 4f5bbec..cf5b00d 100644
+--- a/pkg/controller/utils/imageset/imageset_test.go
++++ b/pkg/controller/utils/imageset/imageset_test.go
+@@ -30,9 +30,25 @@ import (
+ 	operator "github.com/tigera/operator/api/v1"
+ 	"github.com/tigera/operator/pkg/apis"
+ 	"github.com/tigera/operator/pkg/components"
++	"github.com/tigera/operator/test"
+ )
+ 
+ var _ = Describe("imageset tests", func() {
++	It("retains ImageSet naming and validation with exact Calico tag overrides", func() {
++		test.SetCalicoImageTagOverrides(GinkgoT(), `{"node":"v3.33.0-build20261022"}`)
++		Expect(apis.AddToScheme(kscheme.Scheme, false)).To(Succeed())
++		Expect(getSetName(operator.Calico)).To(Equal("calico-v3.33.0"))
++		is := &operator.ImageSet{
++			ObjectMeta: metav1.ObjectMeta{Name: "calico-v3.33.0"},
++			Spec:       operator.ImageSetSpec{Images: []operator.Image{{Image: "calico/node", Digest: "invalid"}}},
++		}
++		c := fake.NewClientBuilder().WithScheme(kscheme.Scheme).WithObjects(is).Build()
++		Expect(ApplyImageSet(context.Background(), c, operator.Calico)).To(MatchError(ContainSubstring("bad digest images")))
++		is.Name = "calico-wrong-version"
++		c = fake.NewClientBuilder().WithScheme(kscheme.Scheme).WithObjects(is).Build()
++		Expect(ApplyImageSet(context.Background(), c, operator.Calico)).To(MatchError(ContainSubstring("expected name calico-v3.33.0")))
++	})
++
+ 	BeforeEach(func() {
+ 		Expect(apis.AddToScheme(kscheme.Scheme, false)).NotTo(HaveOccurred())
+ 	})
+diff --git a/pkg/render/kubecontrollers/kube-controllers_test.go b/pkg/render/kubecontrollers/kube-controllers_test.go
+index 00c20eb..cbf527f 100644
+--- a/pkg/render/kubecontrollers/kube-controllers_test.go
++++ b/pkg/render/kubecontrollers/kube-controllers_test.go
+@@ -46,6 +46,7 @@ import (
+ 	rtest "github.com/tigera/operator/pkg/render/common/test"
+ 	"github.com/tigera/operator/pkg/render/kubecontrollers"
+ 	"github.com/tigera/operator/pkg/render/testutils"
++	"github.com/tigera/operator/test"
+ )
+ 
+ var _ = Describe("kube-controllers rendering tests", func() {
+@@ -93,6 +94,24 @@ var _ = Describe("kube-controllers rendering tests", func() {
+ 		}
+ 	})
+ 
++	It("honors exact Calico tag overrides without changing Enterprise replacements", func() {
++		test.SetCalicoImageTagOverrides(GinkgoT(), `{"calico":"v3.33.0-build20261022"}`)
++		component := kubecontrollers.NewCalicoKubeControllers(&cfg)
++		Expect(component.ResolveImages(nil)).To(Succeed())
++		resources, _ := component.Objects()
++		dp := rtest.GetResource(resources, kubecontrollers.KubeController, common.CalicoNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
++		Expect(dp.Spec.Template.Spec.Containers[0].Image).To(Equal("test-reg/calico/calico:v3.33.0-build20261022"))
++
++		instance.Variant = operatorv1.CalicoEnterprise
++		cfg.ImageOverrides = imageoverride.New()
++		cfg.ImageOverrides.Register(operatorv1.CalicoEnterprise, render.ComponentNameKubeControllers, components.CalicoCloudImage())
++		component = kubecontrollers.NewCalicoKubeControllers(&cfg)
++		Expect(component.ResolveImages(nil)).To(Succeed())
++		resources, _ = component.Objects()
++		dp = rtest.GetResource(resources, kubecontrollers.KubeController, common.CalicoNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
++		Expect(dp.Spec.Template.Spec.Containers[0].Image).To(Equal("test-reg/tigera/calico:" + components.CalicoCloudImage().Version))
++	})
++
+ 	It("should let the IPAM syncer watch IPReservations", func() {
+ 		component := kubecontrollers.NewCalicoKubeControllers(&cfg)
+ 		Expect(component.ResolveImages(nil)).To(BeNil())
+diff --git a/pkg/render/node_test.go b/pkg/render/node_test.go
+index 0b1888f..d2f533a 100644
+--- a/pkg/render/node_test.go
++++ b/pkg/render/node_test.go
+@@ -44,6 +44,7 @@ import (
+ 	rtest "github.com/tigera/operator/pkg/render/common/test"
+ 	tls2 "github.com/tigera/operator/pkg/tls"
+ 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
++	"github.com/tigera/operator/test"
+ )
+ 
+ var (
+@@ -145,6 +146,45 @@ var _ = Describe("Node rendering tests", func() {
+ 				}
+ 			})
+ 
++			It("honors exact Calico tag overrides in node workload and init containers", func() {
++				test.SetCalicoImageTagOverrides(GinkgoT(), `{"calico":"v3.33.0-build20261022","node":"v3.33.0-build20261023","third-party-cni-plugins":"v3.33.0-build20261024"}`)
++				cfg.Installation.Variant = operatorv1.Calico
++				cfg.Installation.Registry = "mirror.example:5000"
++				cfg.Installation.ImagePath = "rancher"
++				cfg.Installation.ImagePrefix = "hardened-calico-"
++				cfg.Installation.FlexVolumePath = "/usr/libexec/kubernetes/kubelet-plugins/volume/exec/"
++				component := render.Node(&cfg)
++				Expect(component.ResolveImages(nil)).To(Succeed())
++				resources, _ := component.Objects()
++				ds := rtest.GetResource(resources, common.NodeDaemonSetName, common.CalicoNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
++				base := "mirror.example:5000/rancher/hardened-calico-"
++				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(base + "node:v3.33.0-build20261023"))
++				expected := map[string]string{
++					"flexvol-driver": base + "calico:v3.33.0-build20261022",
++					"ebpf-bootstrap": base + "node:v3.33.0-build20261023",
++					"cni-plugins":    base + "third-party-cni-plugins:v3.33.0-build20261024",
++					"install-cni":    base + "calico:v3.33.0-build20261022",
++				}
++				for _, container := range ds.Spec.Template.Spec.InitContainers {
++					if image, ok := expected[container.Name]; ok {
++						Expect(container.Image).To(Equal(image), container.Name)
++						delete(expected, container.Name)
++					}
++					if container.Name == "cni-plugins" {
++						Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{Name: "cni-plugins-stage", MountPath: "/stage"}))
++					}
++				}
++				Expect(expected).To(BeEmpty(), "required init containers must all be rendered")
++				Expect(ds.Spec.Template.Spec.Volumes).To(ContainElement(corev1.Volume{Name: "cni-plugins-stage", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}))
++
++				cfg.ImageOverrides.Register(operatorv1.Calico, render.ComponentNameNode, components.ComponentTigeraNode)
++				component = render.Node(&cfg)
++				Expect(component.ResolveImages(nil)).To(Succeed())
++				resources, _ = component.Objects()
++				ds = rtest.GetResource(resources, common.NodeDaemonSetName, common.CalicoNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
++				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(base + "node:" + components.ComponentTigeraNode.Version))
++			})
++
+ 			It("should render SecurityContextConstrains properly when provider is OpenShift", func() {
+ 				cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
+ 				component := render.Node(&cfg)
+diff --git a/pkg/render/typha_test.go b/pkg/render/typha_test.go
+index 6751058..3fa832e 100644
+--- a/pkg/render/typha_test.go
++++ b/pkg/render/typha_test.go
+@@ -41,6 +41,7 @@ import (
+ 	"github.com/tigera/operator/pkg/render"
+ 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
+ 	rtest "github.com/tigera/operator/pkg/render/common/test"
++	"github.com/tigera/operator/test"
+ )
+ 
+ var _ = Describe("Typha rendering tests", func() {
+@@ -85,6 +86,15 @@ var _ = Describe("Typha rendering tests", func() {
+ 		}
+ 	})
+ 
++	It("honors exact Calico tag overrides in Typha", func() {
++		test.SetCalicoImageTagOverrides(GinkgoT(), `{"calico":"v3.33.0-build20261022"}`)
++		component := render.Typha(&cfg)
++		Expect(component.ResolveImages(nil)).To(Succeed())
++		resources, _ := component.Objects()
++		deploy := rtest.GetResource(resources, "calico-typha", "calico-system", "apps", "v1", "Deployment").(*appsv1.Deployment)
++		Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal(registry + "/calico/calico:v3.33.0-build20261022"))
++	})
++
+ 	It("should default to bootstrap tolerations that respect cordoning", func() {
+ 		component := render.Typha(&cfg)
+ 		Expect(component.ResolveImages(nil)).To(BeNil())
+diff --git a/pkg/render/whisker/component_test.go b/pkg/render/whisker/component_test.go
+index 8e4d959..41c187c 100644
+--- a/pkg/render/whisker/component_test.go
++++ b/pkg/render/whisker/component_test.go
+@@ -33,6 +33,7 @@ import (
+ 	rtest "github.com/tigera/operator/pkg/render/common/test"
+ 	"github.com/tigera/operator/pkg/render/whisker"
+ 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
++	"github.com/tigera/operator/test"
+ )
+ 
+ var (
+@@ -52,6 +53,34 @@ var (
+ )
+ 
+ var _ = Describe("ComponentRendering", func() {
++	It("honors partial Calico tag overrides without inventing optional Whisker tags", func() {
++		test.SetCalicoImageTagOverrides(GinkgoT(), `{"calico":"v3.33.0-build20261022"}`)
++		component := whisker.Whisker(&whisker.Configuration{
++			Installation: &operatorv1.InstallationSpec{
++				Variant:     operatorv1.Calico,
++				Registry:    "registry.suse.com",
++				ImagePath:   "rancher",
++				ImagePrefix: "hardened-calico-",
++			},
++			TrustedCertBundle:     defaultTrustedCertBundle,
++			WhiskerKeyPair:        defaultWhiskerKeyPair,
++			WhiskerBackendKeyPair: defaultTLSKeyPair,
++			Whisker:               &operatorv1.Whisker{Spec: operatorv1.WhiskerSpec{Notifications: ptr.To(operatorv1.Enabled)}},
++		})
++		Expect(component.ResolveImages(nil)).To(Succeed())
++		objs, _ := component.Objects()
++		deployment, err := rtest.GetResourceOfType[*appsv1.Deployment](objs, whisker.WhiskerName, whisker.WhiskerNamespace)
++		Expect(err).NotTo(HaveOccurred())
++		images := []string{}
++		for _, container := range deployment.Spec.Template.Spec.Containers {
++			images = append(images, container.Image)
++		}
++		Expect(images).To(ContainElements(
++			"registry.suse.com/rancher/hardened-calico-calico:v3.33.0-build20261022",
++			"registry.suse.com/rancher/hardened-calico-whisker:"+components.ComponentCalicoWhisker.Version,
++		))
++	})
++
+ 	DescribeTable("Creation and deletion counts", func(cfg *whisker.Configuration, createObjs, delObjs int) {
+ 		component := whisker.Whisker(cfg)
+ 		objsToCreate, objsToDelete := component.Objects()
+diff --git a/test/tag_overrides.go b/test/tag_overrides.go
+new file mode 100644
+index 0000000..8b56aa0
+--- /dev/null
++++ b/test/tag_overrides.go
+@@ -0,0 +1,23 @@
++package test
++
++import "github.com/tigera/operator/pkg/components"
++
++// SetCalicoImageTagOverrides restores both the environment and resolver state
++// after a test. Tests using this startup-only setting must not run in parallel.
++func SetCalicoImageTagOverrides(t interface {
++	Helper()
++	Cleanup(func())
++	Setenv(string, string)
++	Fatalf(string, ...any)
++}, value string) {
++	t.Helper()
++	t.Cleanup(func() {
++		if _, err := components.LoadCalicoImageTagOverrides(); err != nil {
++			t.Fatalf("restoring image tags: %v", err)
++		}
++	})
++	t.Setenv(components.CalicoImageTagOverridesEnv, value)
++	if _, err := components.LoadCalicoImageTagOverrides(); err != nil {
++		t.Fatalf("loading image tags: %v", err)
++	}
++}
