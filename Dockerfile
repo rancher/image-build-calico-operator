@@ -4,7 +4,7 @@ ARG BCI_IMAGE=registry.suse.com/bci/bci-nano:16.0
 # Image that provides cross compilation tooling.
 FROM --platform=$BUILDPLATFORM rancher/mirrored-tonistiigi-xx:1.6.1 AS xx
 
-FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS builder
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS operator-dev
 # copy xx scripts to the build stage
 COPY --from=xx / /
 RUN apk add --no-cache file make git clang llvm lld curl
@@ -18,7 +18,11 @@ ARG TAG
 RUN git clone --depth=1 https://${PKG}.git $GOPATH/src/${PKG}
 WORKDIR $GOPATH/src/${PKG}
 RUN git fetch --all --tags --prune
-RUN git checkout tags/${TAG} -b ${TAG}
+RUN git checkout tags/${TAG} -b ${TAG} && \
+    git update-ref refs/patch-base HEAD
+COPY patches/ /tmp/operator-patches/
+RUN git apply --check /tmp/operator-patches/*.patch && \
+    git apply --intent-to-add /tmp/operator-patches/*.patch
 RUN go mod download
 
 # Fetch the archives embedded by upstream. Read their versions from the checked-out
@@ -40,6 +44,14 @@ RUN set -eu; \
         --destination pkg/render/gatewayapi; \
     mv "pkg/render/gatewayapi/gateway-helm-$gateway_version.tgz" \
         pkg/render/gatewayapi/gateway-helm.tgz
+
+COPY scripts/export-operator-patch.sh /usr/local/bin/export-operator-patch
+RUN chmod +x /usr/local/bin/export-operator-patch
+CMD ["/bin/sh"]
+
+FROM operator-dev AS builder
+RUN go test -p 2 ./pkg/components ./pkg/render ./pkg/render/kubecontrollers \
+    ./pkg/render/whisker ./pkg/controller/utils/imageset
 
 # cross-compilation setup
 ARG TARGETARCH
