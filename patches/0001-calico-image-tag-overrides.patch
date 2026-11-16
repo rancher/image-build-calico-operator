@@ -1,5 +1,5 @@
 diff --git a/cmd/main.go b/cmd/main.go
-index a8bd80b..6ce9967 100644
+index a8bd80b18..6ce9967c6 100644
 --- a/cmd/main.go
 +++ b/cmd/main.go
 @@ -181,6 +181,15 @@ admission policy installation; once an Installation exists it is the authority o
@@ -19,7 +19,7 @@ index a8bd80b..6ce9967 100644
  	// the bootstrap-crds path where nothing runs afterwards to correct them.
  	switch v := operatortigeraiov1.ProductVariant(bootstrapVariant); {
 diff --git a/pkg/components/references.go b/pkg/components/references.go
-index 49f17c5..c136e91 100644
+index 49f17c59a..c136e91fd 100644
 --- a/pkg/components/references.go
 +++ b/pkg/components/references.go
 @@ -108,6 +108,11 @@ func GetReference(c Component, registry, imagePath, imagePrefix string, is *oper
@@ -36,7 +36,7 @@ index 49f17c5..c136e91 100644
  
 diff --git a/pkg/components/tag_overrides.go b/pkg/components/tag_overrides.go
 new file mode 100644
-index 0000000..24e9262
+index 000000000..24e926286
 --- /dev/null
 +++ b/pkg/components/tag_overrides.go
 @@ -0,0 +1,84 @@
@@ -126,15 +126,16 @@ index 0000000..24e9262
 +}
 diff --git a/pkg/components/tag_overrides_test.go b/pkg/components/tag_overrides_test.go
 new file mode 100644
-index 0000000..8c7a33d
+index 000000000..c6c3dd62a
 --- /dev/null
 +++ b/pkg/components/tag_overrides_test.go
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,100 @@
 +package components
 +
 +import (
 +	"strings"
 +	"testing"
++	"regexp"
 +
 +	operator "github.com/tigera/operator/api/v1"
 +)
@@ -202,8 +203,12 @@ index 0000000..8c7a33d
 +	if _, err := GetReference(ComponentCalico, "", "", "", is); err == nil {
 +		t.Fatal("missing ImageSet entry fell back to tag")
 +	}
-+	if CalicoRelease != "v3.33.0" || ComponentCalicoNode.Version != "v3.33.0" {
-+		t.Fatal("compiled release identity changed")
++	matched, err := regexp.MatchString(`^v3.[0-9]+.[0-9]+$`, ComponentCalicoNode.Version)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !matched {
++		t.Fatalf("compiled release identity changed %s", ComponentCalicoNode.Version)
 +	}
 +	for _, value := range []string{"{}", ""} {
 +		if value == "" {
@@ -219,17 +224,17 @@ index 0000000..8c7a33d
 +		}
 +		for _, prefix := range []string{"", "hardened-calico-"} {
 +			got, err := GetReference(ComponentCalicoNode, "mirror", "images", prefix, nil)
-+			if want := "mirror/images/" + prefix + "node:v3.33.0"; err != nil || got != want {
++			if want := "mirror/images/" + prefix + "node:" + ComponentCalicoNode.Version; err != nil || got != want {
 +				t.Fatalf("no-op changed reference: %q, %v", got, err)
 +			}
 +		}
 +	}
 +}
 diff --git a/pkg/controller/utils/imageset/imageset_test.go b/pkg/controller/utils/imageset/imageset_test.go
-index 4f5bbec..cf5b00d 100644
+index 4f5bbecf4..8324959d3 100644
 --- a/pkg/controller/utils/imageset/imageset_test.go
 +++ b/pkg/controller/utils/imageset/imageset_test.go
-@@ -30,9 +30,25 @@ import (
+@@ -30,9 +30,26 @@ import (
  	operator "github.com/tigera/operator/api/v1"
  	"github.com/tigera/operator/pkg/apis"
  	"github.com/tigera/operator/pkg/components"
@@ -240,23 +245,24 @@ index 4f5bbec..cf5b00d 100644
 +	It("retains ImageSet naming and validation with exact Calico tag overrides", func() {
 +		test.SetCalicoImageTagOverrides(GinkgoT(), `{"node":"v3.33.0-build20261022"}`)
 +		Expect(apis.AddToScheme(kscheme.Scheme, false)).To(Succeed())
-+		Expect(getSetName(operator.Calico)).To(Equal("calico-v3.33.0"))
++		currentImage := "calico-" + components.CalicoRelease
++		Expect(getSetName(operator.Calico)).To(Equal(currentImage))
 +		is := &operator.ImageSet{
-+			ObjectMeta: metav1.ObjectMeta{Name: "calico-v3.33.0"},
++			ObjectMeta: metav1.ObjectMeta{Name: currentImage},
 +			Spec:       operator.ImageSetSpec{Images: []operator.Image{{Image: "calico/node", Digest: "invalid"}}},
 +		}
 +		c := fake.NewClientBuilder().WithScheme(kscheme.Scheme).WithObjects(is).Build()
 +		Expect(ApplyImageSet(context.Background(), c, operator.Calico)).To(MatchError(ContainSubstring("bad digest images")))
 +		is.Name = "calico-wrong-version"
 +		c = fake.NewClientBuilder().WithScheme(kscheme.Scheme).WithObjects(is).Build()
-+		Expect(ApplyImageSet(context.Background(), c, operator.Calico)).To(MatchError(ContainSubstring("expected name calico-v3.33.0")))
++		Expect(ApplyImageSet(context.Background(), c, operator.Calico)).To(MatchError(ContainSubstring("expected name " + currentImage)))
 +	})
 +
  	BeforeEach(func() {
  		Expect(apis.AddToScheme(kscheme.Scheme, false)).NotTo(HaveOccurred())
  	})
 diff --git a/pkg/render/kubecontrollers/kube-controllers_test.go b/pkg/render/kubecontrollers/kube-controllers_test.go
-index 00c20eb..cbf527f 100644
+index 00c20ebaa..cbf527f1c 100644
 --- a/pkg/render/kubecontrollers/kube-controllers_test.go
 +++ b/pkg/render/kubecontrollers/kube-controllers_test.go
 @@ -46,6 +46,7 @@ import (
@@ -293,10 +299,10 @@ index 00c20eb..cbf527f 100644
  		component := kubecontrollers.NewCalicoKubeControllers(&cfg)
  		Expect(component.ResolveImages(nil)).To(BeNil())
 diff --git a/pkg/render/node_test.go b/pkg/render/node_test.go
-index 0b1888f..d2f533a 100644
+index bea135956..40b75e5aa 100644
 --- a/pkg/render/node_test.go
 +++ b/pkg/render/node_test.go
-@@ -44,6 +44,7 @@ import (
+@@ -45,6 +45,7 @@ import (
  	rtest "github.com/tigera/operator/pkg/render/common/test"
  	tls2 "github.com/tigera/operator/pkg/tls"
  	"github.com/tigera/operator/pkg/tls/certificatemanagement"
@@ -304,7 +310,7 @@ index 0b1888f..d2f533a 100644
  )
  
  var (
-@@ -145,6 +146,45 @@ var _ = Describe("Node rendering tests", func() {
+@@ -146,6 +147,45 @@ var _ = Describe("Node rendering tests", func() {
  				}
  			})
  
@@ -351,7 +357,7 @@ index 0b1888f..d2f533a 100644
  				cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
  				component := render.Node(&cfg)
 diff --git a/pkg/render/typha_test.go b/pkg/render/typha_test.go
-index 6751058..3fa832e 100644
+index 675105860..3fa832e38 100644
 --- a/pkg/render/typha_test.go
 +++ b/pkg/render/typha_test.go
 @@ -41,6 +41,7 @@ import (
@@ -379,7 +385,7 @@ index 6751058..3fa832e 100644
  		component := render.Typha(&cfg)
  		Expect(component.ResolveImages(nil)).To(BeNil())
 diff --git a/pkg/render/whisker/component_test.go b/pkg/render/whisker/component_test.go
-index 8e4d959..41c187c 100644
+index 8e4d95904..41c187c58 100644
 --- a/pkg/render/whisker/component_test.go
 +++ b/pkg/render/whisker/component_test.go
 @@ -33,6 +33,7 @@ import (
@@ -427,7 +433,7 @@ index 8e4d959..41c187c 100644
  		objsToCreate, objsToDelete := component.Objects()
 diff --git a/test/tag_overrides.go b/test/tag_overrides.go
 new file mode 100644
-index 0000000..8b56aa0
+index 000000000..8b56aa069
 --- /dev/null
 +++ b/test/tag_overrides.go
 @@ -0,0 +1,23 @@
